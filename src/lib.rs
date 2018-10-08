@@ -140,7 +140,7 @@ impl AsyncWrite for AxiomIo {
     }
 }
 
-pub fn child() -> Result<impl Read + Write, Error> {
+pub fn child() -> Result<AxiomIo, Error> {
     let axon_fd_out : RawFd = env::var("AXON_FD_OUT")
         .map_err(|_| Error::new(ErrorKind::Other, format!("AXON_FD_OUT missing. executable needs to be spawned from an axon host")))?
         .parse()
