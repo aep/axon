@@ -1,5 +1,6 @@
 extern crate nix;
 extern crate tokio;
+extern crate mio;
 
 use tokio::io::{AsyncRead, AsyncWrite};
 use nix::sys::socket::socketpair;
@@ -13,7 +14,6 @@ use std::os::unix::io::RawFd;
 use std::io::Error;
 use std::io::ErrorKind;
 use std::io;
-use nix::unistd::fsync;
 use std::os::unix::io::AsRawFd;
 use std::net::Shutdown;
 use tokio::prelude::Async;
@@ -22,6 +22,8 @@ use std::os::unix::process::CommandExt as StdUnixCommandExt;
 use std::io::{Read,Write};
 use std::env;
 use std::process::Command;
+use tokio::reactor::PollEvented2;
+use nix::unistd::close;
 
 pub trait CommandExt {
     fn spawn_with_axon(&mut self) -> io::Result<(Child, AxiomIo)>;
@@ -43,13 +45,15 @@ impl CommandExt for Command {
             SockFlag::empty(),
         ).unwrap();
 
-        let axon_in   = unsafe{ UnixDatagram::from_raw_fd(o1) };
-        let axon_out  = unsafe{ UnixDatagram::from_raw_fd(i1) };
 
         self.env("AXON_FD_IN", "4");
         self.env("AXON_FD_OUT", "5");
 
         self.before_exec(move || {
+            close(i1).unwrap();
+            close(o1).unwrap();
+
+
             dup2(i2, 4.into())
                 .map_err(|e| Error::new(ErrorKind::Other, e))
                 ?;
@@ -61,8 +65,12 @@ impl CommandExt for Command {
 
         let child = self.spawn()?;
 
-        axon_in.shutdown(Shutdown::Write)?;
-        axon_out.shutdown(Shutdown::Read)?;
+        let axon_in   = unsafe{ UnixDatagram::from_raw_fd(o1) };
+        let axon_out  = unsafe{ UnixDatagram::from_raw_fd(i1) };
+
+        close(i2).unwrap();
+        close(o2).unwrap();
+
 
         let io = AxiomIo {
             axon_in,
@@ -77,12 +85,27 @@ impl CommandExt for Command {
 
 
 pub struct AxiomIo {
-    axon_in: UnixDatagram,
+    axon_in:  UnixDatagram,
     axon_out: UnixDatagram,
 }
 
+
+impl mio::event::Evented for AxiomIo {
+    fn register(&self, poll: &mio::Poll, token: mio::Token, interest: mio::Ready, opts: mio::PollOpt) -> io::Result<()> {
+        mio::unix::EventedFd(&self.axon_in.as_raw_fd()).register(poll, token, interest, opts)
+    }
+
+    fn reregister(&self, poll: &mio::Poll, token: mio::Token, interest: mio::Ready, opts: mio::PollOpt) -> io::Result<()> {
+        mio::unix::EventedFd(&self.axon_in.as_raw_fd()).reregister(poll, token, interest, opts)
+    }
+
+    fn deregister(&self, poll: &mio::Poll) -> io::Result<()> {
+        mio::unix::EventedFd(&self.axon_in.as_raw_fd()).deregister(poll)
+    }
+}
+
 impl AxiomIo {
-    pub fn make_async(&mut self) -> io::Result<()> {
+    pub fn into_async(self, handle: &tokio::reactor::Handle) -> io::Result<PollEvented2<Self>> {
         use nix::fcntl::{fcntl, FdFlag, OFlag};
         use nix::fcntl::FcntlArg::{F_SETFD, F_SETFL};
 
@@ -94,7 +117,7 @@ impl AxiomIo {
             .map_err(|e| Error::new(ErrorKind::Other, e))
             ?;
 
-        Ok(())
+        PollEvented2::new_with_handle(self, handle)
     }
 
     pub fn shutdown(&self, how: Shutdown) -> io::Result<()> {
@@ -126,8 +149,7 @@ impl Write for AxiomIo {
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        fsync(self.axon_out.as_raw_fd())
-            .map_err(|e| Error::new(ErrorKind::Other, e))
+        Ok(())
     }
 }
 
@@ -153,8 +175,6 @@ pub fn child() -> Result<AxiomIo, Error> {
 
     let axon_in  = unsafe{UnixDatagram::from_raw_fd(axon_fd_in)};
     let axon_out = unsafe{UnixDatagram::from_raw_fd(axon_fd_out)};
-    axon_in.shutdown(Shutdown::Write)?;
-    axon_out.shutdown(Shutdown::Read)?;
 
     Ok(AxiomIo {
         axon_in,

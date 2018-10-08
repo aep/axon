@@ -1,6 +1,6 @@
 [package]
 name = "axon"
-version = "0.1.1"
+version = "0.1.2"
 authors = ["Arvid E. Picciani <aep@devguard.io>"]
 description = "run a command like a plugin with rpc"
 license = "MIT"
@@ -8,6 +8,7 @@ homepage = "https://github.com/aep/axon"
 repository = "https://github.com/aep/axon"
 
 [dependencies]
-nix = "0.11"
+nix     = "0.11"
 futures = "0.1.24"
-tokio = "0.1.11"
+tokio   = "0.1.11"
+mio     = "0.6"

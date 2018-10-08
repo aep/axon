@@ -32,6 +32,7 @@ fn child() {
     let mut io = axon::child().expect("axiom setup");
     let mut b = vec![0;10];
     io.read(&mut b).expect("reading from axiom file descriptor");
-    io.write("ok got it".as_bytes()).expect("sending on axiom failed");
     println!("recv in child: {:?}", b);
+    io.write("ok got it".as_bytes()).expect("sending on axiom failed");
+    println!("child is bye bye");
 }
