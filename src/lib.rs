@@ -26,11 +26,11 @@ use nix::unistd::fsync;
 use std::mem::transmute;
 
 pub trait CommandExt {
-    fn spawn_with_axon(&mut self) -> io::Result<(Child, AxiomIo)>;
+    fn spawn_with_axon(&mut self) -> io::Result<(Child, Io)>;
 }
 
 impl CommandExt for Command {
-    fn spawn_with_axon(&mut self) -> io::Result<(Child, AxiomIo)> {
+    fn spawn_with_axon(&mut self) -> io::Result<(Child, Io)> {
         let (i1, i2) = socketpair(
             AddressFamily::Unix,
             SockType::SeqPacket,
@@ -68,7 +68,7 @@ impl CommandExt for Command {
         close(i2).unwrap();
         close(o2).unwrap();
 
-        let io = AxiomIo {
+        let io = Io {
             axon_in : o1,
             axon_out: i1,
             stream:   false,
@@ -81,14 +81,14 @@ impl CommandExt for Command {
 }
 
 
-pub struct AxiomIo {
+pub struct Io {
     axon_in:  RawFd,
     axon_out: RawFd,
     stream:   bool,
 }
 
 
-impl mio::event::Evented for AxiomIo {
+impl mio::event::Evented for Io {
     fn register(&self, poll: &mio::Poll, token: mio::Token, interest: mio::Ready, opts: mio::PollOpt) -> io::Result<()> {
         mio::unix::EventedFd(&self.axon_in).register(poll, token, interest, opts)
     }
@@ -102,7 +102,7 @@ impl mio::event::Evented for AxiomIo {
     }
 }
 
-impl AxiomIo {
+impl Io {
     pub fn into_async(self, handle: &tokio::reactor::Handle) -> io::Result<PollEvented2<Self>> {
         use nix::fcntl::{fcntl, FdFlag, OFlag};
         use nix::fcntl::FcntlArg::{F_SETFD, F_SETFL};
@@ -134,7 +134,7 @@ impl AxiomIo {
     }
 }
 
-impl Read for AxiomIo {
+impl Read for Io {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         match read(self.axon_in, buf) {
             Ok(v) => Ok(v),
@@ -144,7 +144,7 @@ impl Read for AxiomIo {
     }
 }
 
-impl Write for AxiomIo {
+impl Write for Io {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         if self.stream {
             let len : [u8; 8] = unsafe {transmute(buf.len())};
@@ -171,17 +171,17 @@ impl Write for AxiomIo {
 }
 
 
-impl AsyncRead  for AxiomIo {}
-impl AsyncWrite for AxiomIo {
+impl AsyncRead  for Io {}
+impl AsyncWrite for Io {
     fn shutdown(&mut self) -> Result<Async<()>, tokio::io::Error> {
-        AxiomIo::shutdown(self, Shutdown::Both)?;
+        Io::shutdown(self, Shutdown::Both)?;
         Ok(Async::Ready(()))
     }
 }
 
 
 
-fn from_axion() -> Result<AxiomIo, Error> {
+fn from_axion() -> Result<Io, Error> {
     let axon_out : RawFd = env::var("AXON_FD_OUT")
         .map_err(|_| Error::new(ErrorKind::Other, format!("AXON_FD_OUT missing. executable needs to be spawned from an axon host")))?
         .parse()
@@ -192,22 +192,22 @@ fn from_axion() -> Result<AxiomIo, Error> {
         .parse()
         .map_err(|e| Error::new(ErrorKind::Other, e))?;
 
-    Ok(AxiomIo {
+    Ok(Io {
         axon_in,
         axon_out,
         stream: false,
     })
 }
 
-pub fn from_std() -> AxiomIo {
-    AxiomIo {
+pub fn from_std() -> Io {
+    Io {
         axon_in:  0.into(),
         axon_out: 1.into(),
         stream: true,
     }
 }
 
-pub fn child() -> AxiomIo {
+pub fn child() -> Io {
     match from_axion() {
         Ok(v)  => return v,
         Err(e) => eprintln!("{}", e),
