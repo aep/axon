@@ -147,7 +147,8 @@ impl Read for Io {
 impl Write for Io {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         if self.stream {
-            let len : [u8; 8] = unsafe {transmute(buf.len())};
+            let len = buf.len() as u64;
+            let len : [u8; 8] = unsafe {transmute(len)};
             write(self.axon_out, &len).ok();
             write(self.axon_out, b"\n").ok();
         }
