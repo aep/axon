@@ -7,14 +7,11 @@ use nix::sys::socket::socketpair;
 use nix::sys::socket::AddressFamily;
 use nix::sys::socket::SockType;
 use nix::sys::socket::SockFlag;
-use std::os::unix::net::UnixDatagram;
-use std::os::unix::io::FromRawFd;
 use nix::unistd::dup2;
 use std::os::unix::io::RawFd;
 use std::io::Error;
 use std::io::ErrorKind;
 use std::io;
-use std::os::unix::io::AsRawFd;
 use std::net::Shutdown;
 use tokio::prelude::Async;
 use std::process::Child;
@@ -24,6 +21,9 @@ use std::env;
 use std::process::Command;
 use tokio::reactor::PollEvented2;
 use nix::unistd::close;
+use nix::unistd::{read, write};
+use nix::unistd::fsync;
+use std::mem::transmute;
 
 pub trait CommandExt {
     fn spawn_with_axon(&mut self) -> io::Result<(Child, AxiomIo)>;
@@ -65,16 +65,13 @@ impl CommandExt for Command {
 
         let child = self.spawn()?;
 
-        let axon_in   = unsafe{ UnixDatagram::from_raw_fd(o1) };
-        let axon_out  = unsafe{ UnixDatagram::from_raw_fd(i1) };
-
         close(i2).unwrap();
         close(o2).unwrap();
 
-
         let io = AxiomIo {
-            axon_in,
-            axon_out,
+            axon_in : o1,
+            axon_out: i1,
+            stream:   false,
         };
 
 
@@ -85,22 +82,23 @@ impl CommandExt for Command {
 
 
 pub struct AxiomIo {
-    axon_in:  UnixDatagram,
-    axon_out: UnixDatagram,
+    axon_in:  RawFd,
+    axon_out: RawFd,
+    stream:   bool,
 }
 
 
 impl mio::event::Evented for AxiomIo {
     fn register(&self, poll: &mio::Poll, token: mio::Token, interest: mio::Ready, opts: mio::PollOpt) -> io::Result<()> {
-        mio::unix::EventedFd(&self.axon_in.as_raw_fd()).register(poll, token, interest, opts)
+        mio::unix::EventedFd(&self.axon_in).register(poll, token, interest, opts)
     }
 
     fn reregister(&self, poll: &mio::Poll, token: mio::Token, interest: mio::Ready, opts: mio::PollOpt) -> io::Result<()> {
-        mio::unix::EventedFd(&self.axon_in.as_raw_fd()).reregister(poll, token, interest, opts)
+        mio::unix::EventedFd(&self.axon_in).reregister(poll, token, interest, opts)
     }
 
     fn deregister(&self, poll: &mio::Poll) -> io::Result<()> {
-        mio::unix::EventedFd(&self.axon_in.as_raw_fd()).deregister(poll)
+        mio::unix::EventedFd(&self.axon_in).deregister(poll)
     }
 }
 
@@ -109,11 +107,10 @@ impl AxiomIo {
         use nix::fcntl::{fcntl, FdFlag, OFlag};
         use nix::fcntl::FcntlArg::{F_SETFD, F_SETFL};
 
-        let infd = self.axon_in.as_raw_fd();
-        fcntl(infd, F_SETFD(FdFlag::FD_CLOEXEC))
+        fcntl(self.axon_in, F_SETFD(FdFlag::FD_CLOEXEC))
             .map_err(|e| Error::new(ErrorKind::Other, e))
             ?;
-        fcntl(infd, F_SETFL(OFlag::O_NONBLOCK))
+        fcntl(self.axon_in, F_SETFL(OFlag::O_NONBLOCK))
             .map_err(|e| Error::new(ErrorKind::Other, e))
             ?;
 
@@ -123,14 +120,14 @@ impl AxiomIo {
     pub fn shutdown(&self, how: Shutdown) -> io::Result<()> {
         match how {
             Shutdown::Read => {
-                self.axon_in.shutdown(Shutdown::Both)?;
+                close(self.axon_in).ok();
             },
             Shutdown::Write => {
-                self.axon_out.shutdown(Shutdown::Both)?;
+                close(self.axon_out).ok();
             },
             Shutdown::Both => {
-                self.axon_in.shutdown(Shutdown::Both)?;
-                self.axon_out.shutdown(Shutdown::Both)?;
+                close(self.axon_in).ok();
+                close(self.axon_out).ok();
             },
         }
         Ok(())
@@ -139,16 +136,36 @@ impl AxiomIo {
 
 impl Read for AxiomIo {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.axon_in.recv(buf)
+        match read(self.axon_in, buf) {
+            Ok(v) => Ok(v),
+            Err(nix::Error::Sys(errno)) => Err(io::Error::from_raw_os_error(errno as i32)),
+            Err(e) => Err(Error::new(ErrorKind::Other, e)),
+        }
     }
 }
 
 impl Write for AxiomIo {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.axon_out.send(buf)
+        if self.stream {
+            let len : [u8; 8] = unsafe {transmute(buf.len())};
+            write(self.axon_out, &len).ok();
+            write(self.axon_out, b"\n").ok();
+        }
+        let r = match write(self.axon_out, buf) {
+            Ok(v) => Ok(v),
+            Err(nix::Error::Sys(errno)) => Err(io::Error::from_raw_os_error(errno as i32)),
+            Err(e) => Err(Error::new(ErrorKind::Other, e)),
+        };
+
+        if self.stream {
+            write(self.axon_out, b"\n").ok();
+        }
+
+        r
     }
 
     fn flush(&mut self) -> io::Result<()> {
+        fsync(self.axon_out).ok();
         Ok(())
     }
 }
@@ -162,24 +179,40 @@ impl AsyncWrite for AxiomIo {
     }
 }
 
-pub fn child() -> Result<AxiomIo, Error> {
-    let axon_fd_out : RawFd = env::var("AXON_FD_OUT")
+
+
+fn from_axion() -> Result<AxiomIo, Error> {
+    let axon_out : RawFd = env::var("AXON_FD_OUT")
         .map_err(|_| Error::new(ErrorKind::Other, format!("AXON_FD_OUT missing. executable needs to be spawned from an axon host")))?
         .parse()
         .map_err(|e| Error::new(ErrorKind::Other, e))?;
 
-    let axon_fd_in : RawFd = env::var("AXON_FD_IN")
+    let axon_in : RawFd = env::var("AXON_FD_IN")
         .map_err(|_| Error::new(ErrorKind::Other, format!("AXON_FD_IN  missing. executable needs to be spawned from an axon host")))?
         .parse()
         .map_err(|e| Error::new(ErrorKind::Other, e))?;
 
-    let axon_in  = unsafe{UnixDatagram::from_raw_fd(axon_fd_in)};
-    let axon_out = unsafe{UnixDatagram::from_raw_fd(axon_fd_out)};
-
     Ok(AxiomIo {
         axon_in,
         axon_out,
+        stream: false,
     })
+}
+
+pub fn from_std() -> AxiomIo {
+    AxiomIo {
+        axon_in:  0.into(),
+        axon_out: 1.into(),
+        stream: true,
+    }
+}
+
+pub fn child() -> AxiomIo {
+    match from_axion() {
+        Ok(v)  => return v,
+        Err(e) => eprintln!("{}", e),
+    }
+    from_std()
 }
 
 

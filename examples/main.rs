@@ -29,7 +29,7 @@ fn main() {
 }
 
 fn child() {
-    let mut io = axon::child().expect("axiom setup");
+    let mut io = axon::child();
     let mut b = vec![0;10];
     io.read(&mut b).expect("reading from axiom file descriptor");
     println!("recv in child: {:?}", b);
