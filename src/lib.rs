@@ -81,6 +81,7 @@ impl CommandExt for Command {
 }
 
 
+#[derive(Clone)]
 pub struct Io {
     axon_in:  RawFd,
     axon_out: RawFd,
@@ -135,6 +136,16 @@ impl Io {
 }
 
 impl Read for Io {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match read(self.axon_in, buf) {
+            Ok(v) => Ok(v),
+            Err(nix::Error::Sys(errno)) => Err(io::Error::from_raw_os_error(errno as i32)),
+            Err(e) => Err(Error::new(ErrorKind::Other, e)),
+        }
+    }
+}
+
+impl Read for &Io {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         match read(self.axon_in, buf) {
             Ok(v) => Ok(v),
