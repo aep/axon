@@ -1,8 +1,8 @@
 extern crate nix;
-extern crate tokio;
-extern crate mio;
+extern crate osaka;
+extern crate mio_extras;
+extern crate log;
 
-use tokio::io::{AsyncRead, AsyncWrite};
 use nix::sys::socket::socketpair;
 use nix::sys::socket::AddressFamily;
 use nix::sys::socket::SockType;
@@ -13,24 +13,50 @@ use std::io::Error;
 use std::io::ErrorKind;
 use std::io;
 use std::net::Shutdown;
-use tokio::prelude::Async;
-use std::process::Child;
+use std::process;
 use std::os::unix::process::CommandExt as StdUnixCommandExt;
 use std::io::{Read,Write};
 use std::env;
 use std::process::Command;
-use tokio::reactor::PollEvented2;
 use nix::unistd::close;
 use nix::unistd::{read, write};
 use nix::unistd::fsync;
 use std::mem::transmute;
+use mio_extras::channel;
+use std::thread;
+use std::mem;
+use std::time::Duration;
+use osaka::mio;
+use log::{error};
+
+
+pub struct Child {
+    pub io:     Io,
+    pub c:      Option<process::Child>,
+    pub wait:   channel::Receiver<()>,
+}
+
+impl Drop for Child {
+    fn drop(&mut self) {
+        close(self.io.axon_in).ok();
+        close(self.io.axon_out).ok();
+        let mut c = mem::replace(&mut self.c, None).unwrap();
+        thread::spawn(move || {
+
+            std::mem::replace(&mut c.stdout, None);
+            thread::sleep(Duration::from_millis(100));
+            c.kill().ok();
+            c.wait().ok();
+        });
+    }
+}
 
 pub trait CommandExt {
-    fn spawn_with_axon(&mut self) -> io::Result<(Child, Io)>;
+    fn spawn_with_axon(&mut self) -> io::Result<Child>;
 }
 
 impl CommandExt for Command {
-    fn spawn_with_axon(&mut self) -> io::Result<(Child, Io)> {
+    fn spawn_with_axon(&mut self) -> io::Result<Child> {
         let (i1, i2) = socketpair(
             AddressFamily::Unix,
             SockType::SeqPacket,
@@ -63,19 +89,35 @@ impl CommandExt for Command {
             Ok(())
         });
 
+        let (sender, receiver) = channel::channel();
+
         let child = self.spawn()?;
 
         close(i2).unwrap();
         close(o2).unwrap();
+
 
         let io = Io {
             axon_in : o1,
             axon_out: i1,
             stream:   false,
         };
+        let pid = nix::unistd::Pid::from_raw(child.id() as i32);
+        thread::spawn(move || {
+            if let Err(e) = nix::sys::wait::waitpid(Some(pid), None) {
+                error!("in pty waitpid: {}", e);
+            }
+            if let Err(e) = sender.send(()) {
+                error!("in pty after waitpid, trying to send exit signal: {}", e);
+            }
 
+        });
 
-        Ok((child, io))
+        Ok(Child{
+            wait: receiver,
+            io,
+            c: Some(child),
+        })
     }
 
 }
@@ -89,7 +131,7 @@ pub struct Io {
 }
 
 
-impl mio::event::Evented for Io {
+impl osaka::mio::event::Evented for Io {
     fn register(&self, poll: &mio::Poll, token: mio::Token, interest: mio::Ready, opts: mio::PollOpt) -> io::Result<()> {
         mio::unix::EventedFd(&self.axon_in).register(poll, token, interest, opts)
     }
@@ -104,18 +146,16 @@ impl mio::event::Evented for Io {
 }
 
 impl Io {
-    pub fn into_async(self, handle: &tokio::reactor::Handle) -> io::Result<PollEvented2<Self>> {
+    pub fn make_async(&mut self) -> io::Result<()> {
         use nix::fcntl::{fcntl, FdFlag, OFlag};
         use nix::fcntl::FcntlArg::{F_SETFD, F_SETFL};
-
         fcntl(self.axon_in, F_SETFD(FdFlag::FD_CLOEXEC))
             .map_err(|e| Error::new(ErrorKind::Other, e))
             ?;
         fcntl(self.axon_in, F_SETFL(OFlag::O_NONBLOCK))
             .map_err(|e| Error::new(ErrorKind::Other, e))
             ?;
-
-        PollEvented2::new_with_handle(self, handle)
+        Ok(())
     }
 
     pub fn shutdown(&self, how: Shutdown) -> io::Result<()> {
@@ -181,16 +221,6 @@ impl Write for Io {
         Ok(())
     }
 }
-
-
-impl AsyncRead  for Io {}
-impl AsyncWrite for Io {
-    fn shutdown(&mut self) -> Result<Async<()>, tokio::io::Error> {
-        Io::shutdown(self, Shutdown::Both)?;
-        Ok(Async::Ready(()))
-    }
-}
-
 
 
 fn from_axion() -> Result<Io, Error> {
