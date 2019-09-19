@@ -1,5 +1,4 @@
 extern crate nix;
-extern crate tokio;
 extern crate axon;
 
 use std::env;
@@ -13,18 +12,18 @@ fn main() {
         child();
         return;
     }
-    let (mut child, mut io) = Command::new(env::current_exe().unwrap())
+    let mut child = Command::new(env::current_exe().unwrap())
         .arg("child")
         .spawn_with_axon()
         .expect("Failed to start echo process");
 
-    io.write("yolo".as_bytes()).unwrap();
+    child.io.write("yolo".as_bytes()).unwrap();
 
     let mut b = vec![0;20];
-    io.read(&mut b).unwrap();
+    child.io.read(&mut b).unwrap();
     println!("recv in parent: {:?}", b);
 
-    let ecode = child.wait().expect("failed to wait on child");
+    let ecode = child.c.as_mut().unwrap().wait().expect("failed to wait on child");
     assert!(ecode.success());
 }
 
